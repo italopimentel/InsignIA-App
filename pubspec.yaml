@@ -31,7 +31,8 @@ dependencies:
   camera: ^0.10.0
   permission_handler: ^11.0.1
   http: ^1.2.0
-  image: ^3.0.1
+  image:
+  http_parser:
   flutter:
     sdk: flutter
 

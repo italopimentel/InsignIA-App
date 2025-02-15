@@ -1,12 +1,12 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:http/http.dart' as http;
-import 'package:image/image.dart' as img;
+import 'package:http_parser/http_parser.dart';
+import 'package:image/image.dart' as imgLib;
 
 void main() => runApp(MyApp());
 
@@ -79,9 +79,7 @@ class CameraScreen extends StatefulWidget {
 
 class _CameraScreenState extends State<CameraScreen> {
   late CameraController _cameraController;
-  late Future<void> _initializeControllerFuture;
   bool _isCameraInitialized = false;
-  Timer? _timer;
   bool _isSending = false;
 
   @override
@@ -91,67 +89,107 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initializeCamera() async {
+    final cameras = await availableCameras();
+    final firstCamera = cameras.first;
 
-    if (await _requestPermissions()) {
-      final cameras = await availableCameras();
-      final firstCamera = cameras.first;
+    _cameraController = CameraController(
+      firstCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
 
-      _cameraController = CameraController(firstCamera, ResolutionPreset.medium);
-      _initializeControllerFuture = _cameraController.initialize();
-      await _initializeControllerFuture;
+    await _cameraController.initialize();
 
-      await _cameraController.setFlashMode(FlashMode.off);
-      _startPeriodicImageSend();
-      setState(() {
-        _isCameraInitialized = true;
-      });
-    } else {
-      print("Permissões não concedidas.");
-    }
-  }
+    if (!mounted) return;
+    setState(() {
+      _isCameraInitialized = true;
+    });
 
-  void _startPeriodicImageSend() {
-
-    _timer = Timer.periodic(Duration(milliseconds: 35), (timer) {
+    _cameraController.startImageStream((CameraImage image) {
       if (!_isSending) {
-        _captureAndSendBytes();
+        _isSending = true;
+        Future.microtask(() => _processAndSendFrame(image).then((_){
+          _isSending = false;
+        }));
       }
     });
   }
 
-  Future<void> _captureAndSendBytes() async {
+  Future<void> _sendImageBytesToServer(Uint8List imageBytes) async {
     try {
-      await _initializeControllerFuture;
+      final url = Uri.parse('http://192.168.1.113:5000/upload_video');
 
-      final image = await _cameraController.takePicture();
+      var request = http.MultipartRequest('POST', url);
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'frame',
+          imageBytes,
+          filename: 'frame.jpg',
+          contentType: MediaType('image', 'jpeg'), // Define o tipo MIME correto
+        ),
+      );
 
-      Uint8List imageBytes = await image.readAsBytes();
+      var response = await request.send();
 
-      //final originalImage = img.decodeImage(imageBytes);
-      //final compressedImage = img.encodeJpg(originalImage!, quality: 70);
-
-
-      await _sendImageBytesToServer(imageBytes);
-
-      print("imagem enviada com sucesso!");
+      if (response.statusCode == 200) {
+        print('Frame enviado com sucesso!');
+      } else {
+        print('Erro ao enviar frame: ${response.statusCode}');
+      }
     } catch (e) {
-      print(e);
+      print("Erro na requisição: $e");
     }
   }
 
-  Future<void> _sendImageBytesToServer(Uint8List imageBytes) async {
+  //algoritmo tirado do stack overflow: https://stackoverflow.com/questions/76760769/convert-cameraimage-to-jpeg-and-display-flutter-on-android-and-ios
+  imgLib.Image _convertYUV420toImageColor(CameraImage image) {
+    const shift = (0xFF << 24);
 
-    final url = Uri.parse('http://192.168.1.106:5000/upload_video'); // Substitua pela URL
+    final int width = image.width;
+    final int height = image.height;
+    final int uvRowStride = image.planes[1].bytesPerRow;
+    final int uvPixelStride = image.planes[1].bytesPerPixel!;
 
-    var request = http.MultipartRequest('POST', url);
-    request.files.add(http.MultipartFile.fromBytes('frame', imageBytes, filename: 'frame.jpg'));
+    final img = imgLib.Image(width: height, height: width);
 
-    var response = await request.send();
+    // Fill image buffer with plane[0] from YUV420_888
+    for (int x = 0; x < width; x++) {
+      for (int y = 0; y < height; y++) {
+        final int uvIndex =
+            uvPixelStride * (x / 2).floor() + uvRowStride * (y / 2).floor();
+        final int index = y * width + x;
 
-    if (response.statusCode == 200) {
-      print('Imagem enviada com sucesso!');
-    } else {
-      print('Erro ao enviar a imagem. Código: ${response.statusCode}');
+        final yp = image.planes[0].bytes[index];
+        final up = image.planes[1].bytes[uvIndex];
+        final vp = image.planes[2].bytes[uvIndex];
+        // Calculate pixel color
+        int r = (yp + vp * 1436 / 1024 - 179).round().clamp(0, 255);
+        int g = (yp - up * 46549 / 131072 + 44 - vp * 93604 / 131072 + 91)
+            .round()
+            .clamp(0, 255);
+        int b = (yp + up * 1814 / 1024 - 227).round().clamp(0, 255);
+        // color: 0x FF  FF  FF  FFj
+        //           A   B   G   R
+
+        if (img.isBoundsSafe(height - y, x)) {
+          img.setPixelRgba(height - y, x, r, g, b, shift);
+        }
+      }
+    }
+    return img;
+  }
+
+  Future<Uint8List> _convertToJpeg(CameraImage image) async {
+    final rbgImage = _convertYUV420toImageColor(image);
+    return Uint8List.fromList(imgLib.encodeJpg(rbgImage, quality   70));
+  }
+
+  Future<void> _processAndSendFrame(CameraImage image) async {
+    try {
+      Uint8List jpegBytes = await _convertToJpeg(image);
+      await _sendImageBytesToServer(jpegBytes);
+    } catch (e) {
+      print("Erro ao processar frame: $e");
     }
   }
 
@@ -164,11 +202,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
-    _timer?.cancel();
     _cameraController.dispose();
     super.dispose();
   }
-
 
   String selectedLanguage = 'Libras → Português';
 
@@ -182,7 +218,8 @@ class _CameraScreenState extends State<CameraScreen> {
           height: 200,
           child: Column(
             children: [
-              Text("Selecione o idioma", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              Text("Selecione o idioma", style: TextStyle(
+                  fontSize: 18, fontWeight: FontWeight.bold)),
               ListTile(
                 title: Text("Libras → Português"),
                 leading: Radio<String>(
@@ -216,82 +253,85 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  Positioned _languageSelectorButton() {
+    return Positioned(
+      top: 5,
+      left: 5,
+      child:
+      IconButton(
+        icon: Icon(
+            Icons.sign_language_outlined, color: Colors.black, size: 30),
+        onPressed: _showLanguageSelector,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Colors.yellow,
-      title: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             _languageSelectorButton(),
             Center(child: const Text('InSignIA')),
-            ],
+          ],
+        ),
       ),
-      ),
-      body: _initializeControllerFuture == null
-          ? Center(child: CircularProgressIndicator())
-          : SafeArea(
+      body: _isCameraInitialized
+          ? SafeArea(
         child: Stack(
-        children: [
-          Positioned.fill(
-            child: _isCameraInitialized
-                ? CameraPreview(_cameraController)
-                : Center(child: CircularProgressIndicator(color: Colors.white)),
-          ),
-          DraggableScrollableSheet(
-            initialChildSize: 0.2,
-            minChildSize: 0.1,
-            maxChildSize: 0.5,
-            builder: (BuildContext context, ScrollController scrollController) {
-              return Container(
-                padding: EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.yellow.withOpacity(0.9),
-                  borderRadius: BorderRadius.only(
-                    topLeft: Radius.circular(20),
-                    topRight: Radius.circular(20),
+          children: [
+            Positioned.fill(
+              child: _isCameraInitialized
+                  ? CameraPreview(_cameraController)
+                  : Center(
+                  child: CircularProgressIndicator(color: Colors.white)),
+            ),
+            DraggableScrollableSheet(
+              initialChildSize: 0.2,
+              minChildSize: 0.1,
+              maxChildSize: 0.5,
+              builder: (BuildContext context,
+                  ScrollController scrollController) {
+                return Container(
+                  padding: EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.yellow.withOpacity(0.9),
+                    borderRadius: BorderRadius.only(
+                      topLeft: Radius.circular(20),
+                      topRight: Radius.circular(20),
+                    ),
                   ),
-                ),
-                child: SingleChildScrollView(
-                  controller: scrollController,
-                  child: Column(
-                    children: [
-                      Container(
-                        width: 50,
-                        height: 5,
-                        margin: EdgeInsets.only(bottom: 8),
-                        decoration: BoxDecoration(
-                          color: Colors.white60,
-                          borderRadius: BorderRadius.circular(2),
+                  child: SingleChildScrollView(
+                    controller: scrollController,
+                    child: Column(
+                      children: [
+                        Container(
+                          width: 50,
+                          height: 5,
+                          margin: EdgeInsets.only(bottom: 8),
+                          decoration: BoxDecoration(
+                            color: Colors.white60,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
                         ),
-                      ),
-                      Text(
-                        "Texto traduzido de LIBRAS para português",
-                        style: TextStyle(color: Colors.black, fontSize: 16),
-                        textAlign: TextAlign.center,
-                      ),
-                    ],
+                        Text(
+                          "Texto traduzido de LIBRAS para português",
+                          style: TextStyle(color: Colors.black, fontSize: 16),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              );
-            },
-          ),
-        ],
-      ),
-      ),
+                );
+              },
+            ),
+          ],
+        ),
+      )
+          : Center(child: CircularProgressIndicator()),
     );
-  }
-
-  Positioned _languageSelectorButton() {
-    return Positioned(
-          top: 5,
-          left: 5,
-          child:
-          IconButton(
-            icon: Icon(Icons.sign_language_outlined, color: Colors.black, size: 30),
-            onPressed: _showLanguageSelector,
-          ),
-        );
   }
 }
