@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'dart:isolate';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -8,7 +11,11 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:image/image.dart' as imgLib;
 
-void main() => runApp(MyApp());
+String processedText = "";
+
+void main(){
+  runApp(MyApp());
+}
 
 class MyApp extends StatelessWidget {
   @override
@@ -111,13 +118,36 @@ class _CameraScreenState extends State<CameraScreen> {
         Future.microtask(() => _processAndSendFrame(image).then((_){
           _isSending = false;
         }));
+        Future.microtask(() => getDataFromServer());
       }
     });
   }
 
+  Future<void> getDataFromServer() async {
+    String url = 'http://192.168.1.106:5000/get-result';
+    try {
+      final response = await http.get(Uri.parse(url));
+
+      if (response.statusCode == 200) {
+        var data = json.decode(response.body);
+        print('Dados recebidos: $data');
+        if (data["should_read"] == true)
+          {
+            setState(() {
+              processedText += data["last_read"] + " ";
+            });
+          }
+      } else {
+        print('Erro: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('Erro ao buscar dados: $e');
+    }
+  }
+
   Future<void> _sendImageBytesToServer(Uint8List imageBytes) async {
     try {
-      final url = Uri.parse('http://192.168.1.113:5000/upload_video');
+      final url = Uri.parse('http://192.168.1.106:5000/upload_video');
 
       var request = http.MultipartRequest('POST', url);
       request.files.add(
@@ -181,7 +211,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<Uint8List> _convertToJpeg(CameraImage image) async {
     final rbgImage = _convertYUV420toImageColor(image);
-    return Uint8List.fromList(imgLib.encodeJpg(rbgImage, quality   70));
+    return Uint8List.fromList(imgLib.encodeJpg(rbgImage, quality: 70));
   }
 
   Future<void> _processAndSendFrame(CameraImage image) async {
@@ -318,9 +348,15 @@ class _CameraScreenState extends State<CameraScreen> {
                           ),
                         ),
                         Text(
-                          "Texto traduzido de LIBRAS para português",
+                          processedText,
                           style: TextStyle(color: Colors.black, fontSize: 16),
                           textAlign: TextAlign.center,
+                        ),
+                        IconButton(onPressed: (){
+                          setState(() {
+                            processedText = "";
+                          });
+                        }, icon: const Icon(Icons.delete)
                         ),
                       ],
                     ),
