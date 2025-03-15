@@ -88,6 +88,8 @@ class _CameraScreenState extends State<CameraScreen> {
   late CameraController _cameraController;
   bool _isCameraInitialized = false;
   bool _isSending = false;
+  List<CameraDescription> _cameras = [];
+  int _selectedCameraIndex = 0;
 
   @override
   void initState() {
@@ -96,35 +98,46 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initializeCamera() async {
-    final cameras = await availableCameras();
-    final firstCamera = cameras.first;
+    _cameras = await availableCameras();
+    if (_cameras.isNotEmpty) {
+      _cameraController = CameraController(
+        _cameras[_selectedCameraIndex],
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
 
-    _cameraController = CameraController(
-      firstCamera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
+      await _cameraController.initialize();
+      if (!mounted) return;
+      setState(() {
+        _isCameraInitialized = true;
+      });
 
-    await _cameraController.initialize();
+      _cameraController.startImageStream((CameraImage image) {
+        if (!_isSending) {
+          _isSending = true;
+          Future.microtask(() => _processAndSendFrame(image).then((_) {
+            _isSending = false;
+          }));
+          Future.microtask(() => getDataFromServer());
+        }
+      });
+    }
+  }
 
-    if (!mounted) return;
-    setState(() {
-      _isCameraInitialized = true;
-    });
+  void _switchCamera() async {
+    if (_cameras.length > 1) {
+      setState(() {
+        _isCameraInitialized = false;
+      });
 
-    _cameraController.startImageStream((CameraImage image) {
-      if (!_isSending) {
-        _isSending = true;
-        Future.microtask(() => _processAndSendFrame(image).then((_){
-          _isSending = false;
-        }));
-        Future.microtask(() => getDataFromServer());
-      }
-    });
+      _selectedCameraIndex = (_selectedCameraIndex + 1) % _cameras.length;
+      await _cameraController.dispose();
+      await _initializeCamera();
+    }
   }
 
   Future<void> getDataFromServer() async {
-    String url = 'http://192.168.1.106:5000/get-result';
+    String url = 'http://192.168.1.102:5000/get-result';
     try {
       final response = await http.get(Uri.parse(url));
 
@@ -132,11 +145,11 @@ class _CameraScreenState extends State<CameraScreen> {
         var data = json.decode(response.body);
         print('Dados recebidos: $data');
         if (data["should_read"] == true)
-          {
-            setState(() {
-              processedText += data["last_read"] + " ";
-            });
-          }
+        {
+          setState(() {
+            processedText += data["last_read"] + " ";
+          });
+        }
       } else {
         print('Erro: ${response.statusCode}');
       }
@@ -147,7 +160,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _sendImageBytesToServer(Uint8List imageBytes) async {
     try {
-      final url = Uri.parse('http://192.168.1.106:5000/upload_video');
+      final url = Uri.parse('http://192.168.1.102:5000/upload_video');
 
       var request = http.MultipartRequest('POST', url);
       request.files.add(
@@ -206,7 +219,13 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }
     }
-    return img;
+    if (_selectedCameraIndex == 1 || _selectedCameraIndex == 3) {
+      return imgLib.flipVertical(img);
+    }
+    else
+    {
+      return img;
+    }
   }
 
   Future<Uint8List> _convertToJpeg(CameraImage image) async {
@@ -314,17 +333,26 @@ class _CameraScreenState extends State<CameraScreen> {
         child: Stack(
           children: [
             Positioned.fill(
-              child: _isCameraInitialized
-                  ? CameraPreview(_cameraController)
-                  : Center(
-                  child: CircularProgressIndicator(color: Colors.white)),
+              child: CameraPreview(_cameraController),
+            ),
+            Positioned(
+              top: 15,
+              right: 15,
+              child: Column(
+                children: [
+                  IconButton(
+                    iconSize: 40,
+                    icon: Icon(Icons.switch_video, color: Colors.white,),
+                    onPressed: _switchCamera,
+                  ),
+                ]
+              ),
             ),
             DraggableScrollableSheet(
               initialChildSize: 0.2,
               minChildSize: 0.1,
               maxChildSize: 0.5,
-              builder: (BuildContext context,
-                  ScrollController scrollController) {
+              builder: (BuildContext context, ScrollController scrollController) {
                 return Container(
                   padding: EdgeInsets.all(16),
                   decoration: BoxDecoration(
@@ -352,11 +380,13 @@ class _CameraScreenState extends State<CameraScreen> {
                           style: TextStyle(color: Colors.black, fontSize: 16),
                           textAlign: TextAlign.center,
                         ),
-                        IconButton(onPressed: (){
-                          setState(() {
-                            processedText = "";
-                          });
-                        }, icon: const Icon(Icons.delete)
+                        IconButton(
+                          onPressed: () {
+                            setState(() {
+                              processedText = "";
+                            });
+                          },
+                          icon: const Icon(Icons.delete),
                         ),
                       ],
                     ),
